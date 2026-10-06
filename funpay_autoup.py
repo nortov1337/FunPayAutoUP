@@ -291,6 +291,7 @@ class AutoRaiser:
             self.cfg.max_retries if self.cfg.max_retries else "бесконечно",
             self.cfg.retry_delay,
         )
+        logger.info("Процесс работает постоянно, остановка: Ctrl+C или SIGTERM.")
         while not self._stop:
             started = time.monotonic()
             try:
@@ -601,6 +602,12 @@ def main() -> int:
     )
     arg_parser.add_argument(
         "-m", "--manual", action="store_true", help="Режим ручного поднятия"
+    )
+    arg_parser.add_argument(
+        "-w",
+        "--watch",
+        action="store_true",
+        help="Бесконечный режим: процесс висит и по кругу поднимает лоты (по умолчанию)",
     )
     args = arg_parser.parse_args()
 
