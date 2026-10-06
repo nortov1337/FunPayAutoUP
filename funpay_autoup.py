@@ -299,19 +299,20 @@ class AutoRaiser:
             success, skipped, failed,
         )
 
-    def raise_one(self, category: Category) -> str:
+    def raise_one(self, category: Category, force: bool = False) -> str:
         if not category.common_subcategory_ids:
             logger.warning("Категория \"%s\" не содержит обычных лотов, пропуск.", category.name)
             return "skip"
 
-        now = time.time()
-        last = self.last_raise.get(category.id, 0)
-        if now - last < self.cfg.category_cooldown:
-            logger.info(
-                "Категория \"%s\" на кд, осталось %d c.",
-                category.name, int(self.cfg.category_cooldown - (now - last)),
-            )
-            return "skip"
+        if not force:
+            now = time.time()
+            last = self.last_raise.get(category.id, 0)
+            if now - last < self.cfg.category_cooldown:
+                logger.info(
+                    "Категория \"%s\" на кд, осталось %d c.",
+                    category.name, int(self.cfg.category_cooldown - (now - last)),
+                )
+                return "skip"
 
         attempt = 0
         while not self._stop:
@@ -352,6 +353,116 @@ class AutoRaiser:
             self._sleep(self.cfg.retry_delay)
 
         return "fail"
+
+
+def _print_categories(categories: list, username: str = "") -> None:
+    if username:
+        print(f"Аккаунт: {username}")
+    if not categories:
+        print("Категории не найдены.")
+        return
+    print()
+    print("Доступные категории:")
+    for index, category in enumerate(categories, start=1):
+        count = len(category.common_subcategory_ids)
+        print(f"  {index:>3}. {category.name} (ID {category.id}, подкатегорий: {count})")
+    print()
+
+
+def _parse_selection(raw: str, count: int) -> list:
+    selected = set()
+    for chunk in re.split(r"[,\s]+", raw):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            start, _, end = chunk.partition("-")
+            if start.isdigit() and end.isdigit():
+                for number in range(int(start), int(end) + 1):
+                    if 1 <= number <= count:
+                        selected.add(number - 1)
+        elif chunk.isdigit():
+            number = int(chunk)
+            if 1 <= number <= count:
+                selected.add(number - 1)
+    return sorted(selected)
+
+
+def manual_mode(cfg: Config) -> int:
+    raiser = AutoRaiser(cfg)
+    raiser.cfg.ignore_cooldown = False
+
+    print("=" * 60)
+    print("FunPayAutoUP - ручное поднятие лотов")
+    print("=" * 60)
+    print("Команды:")
+    print("  all          поднять все показанные категории")
+    print("  1,3,5        поднять категории по номерам")
+    print("  2-4          поднять диапазон номеров")
+    print("  r            обновить список категорий с FunPay")
+    print("  q            выход")
+    print()
+
+    try:
+        username, categories = raiser.client.fetch_account()
+    except FunPayError as exc:
+        print(f"Ошибка подключения: {exc}")
+        return 1
+
+    if cfg.games:
+        categories = [c for c in categories if c.id in cfg.games]
+        print(f"Применён фильтр games, категорий: {len(categories)}")
+
+    while True:
+        _print_categories(categories, username)
+        try:
+            raw = input("Выбор> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not raw:
+            continue
+
+        command = raw.lower()
+        if command in ("q", "quit", "exit", "выход", "в"):
+            break
+        if command in ("r", "refresh", "обновить"):
+            try:
+                username, categories = raiser.client.fetch_account()
+                print(f"Список обновлён. Категорий: {len(categories)}")
+            except FunPayError as exc:
+                print(f"Ошибка обновления: {exc}")
+            continue
+        if command in ("h", "help", "?", "помощь"):
+            print("all - все; 1,3 - по номерам; 2-4 - диапазон; r - обновить; q - выход")
+            continue
+
+        if command in ("all", "все", "*"):
+            selected = list(range(len(categories)))
+        else:
+            selected = _parse_selection(raw, len(categories))
+        if not selected:
+            print("Ничего не выбрано.")
+            continue
+
+        print()
+        results = []
+        for index in selected:
+            category = categories[index]
+            result = raiser.raise_one(category, force=True)
+            results.append(result)
+            label = {"ok": "поднято", "skip": "пропущено", "fail": "ошибка"}.get(result, result)
+            print(f"[{label}] {category.name}")
+
+        print()
+        print(
+            f"Итог: поднято {results.count('ok')}, "
+            f"пропущено {results.count('skip')}, ошибок {results.count('fail')}."
+        )
+        print()
+
+    print("Выход.")
+    return 0
 
 
 def setup_logging(cfg: Config) -> None:
@@ -432,6 +543,9 @@ def main() -> int:
     arg_parser.add_argument(
         "-c", "--config", default="config.ini", help="Путь к файлу конфигурации"
     )
+    arg_parser.add_argument(
+        "-m", "--manual", action="store_true", help="Режим ручного поднятия"
+    )
     args = arg_parser.parse_args()
 
     try:
@@ -441,6 +555,13 @@ def main() -> int:
         return 2
 
     setup_logging(cfg)
+
+    if args.manual:
+        try:
+            return manual_mode(cfg)
+        except KeyboardInterrupt:
+            print()
+            return 0
 
     raiser = AutoRaiser(cfg)
     signal.signal(signal.SIGINT, raiser.stop)
