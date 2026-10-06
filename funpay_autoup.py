@@ -79,6 +79,7 @@ class Config:
     retry_delay: float = 30.0
     max_retries: int = 0
     ignore_cooldown: bool = False
+    only_with_lots: bool = True
     games: list = field(default_factory=list)
     log_level: str = "INFO"
     log_file: str = "logs/funpay_autoup.log"
@@ -108,6 +109,7 @@ class FunPayClient:
         self.proxies = {"http": cfg.proxy, "https": cfg.proxy} if cfg.proxy else None
         self.csrf_token: Optional[str] = None
         self.username: Optional[str] = None
+        self.user_id: Optional[int] = None
 
     def _get(self, url: str) -> requests.Response:
         try:
@@ -137,11 +139,38 @@ class FunPayClient:
         body = soup.find("body")
         if body and body.has_attr("data-app-data"):
             try:
-                self.csrf_token = json.loads(body["data-app-data"]).get("csrf-token")
+                app_data = json.loads(body["data-app-data"])
+                self.csrf_token = app_data.get("csrf-token")
+                self.user_id = app_data.get("userId")
             except (ValueError, TypeError):
                 self.csrf_token = None
 
         return self.username, self._parse_categories(html)
+
+    def fetch_active_lot_subcategories(self) -> Optional[set]:
+        if not self.user_id:
+            return None
+        response = self._get(f"{BASE_URL}/users/{self.user_id}/")
+        if response.status_code == 403:
+            raise UnauthorizedError("FunPay вернул 403 при получении списка лотов.")
+        if response.status_code != 200:
+            raise RequestError(f"GET /users/{self.user_id}/ вернул статус {response.status_code}.")
+
+        soup = BeautifulSoup(response.content.decode("utf-8", errors="replace"), "html.parser")
+        active = set()
+        for container in soup.find_all("div", {"class": "offer-list-title-container"}):
+            h3 = container.find("h3")
+            link = h3.find("a") if h3 else None
+            if not link or not link.get("href"):
+                continue
+            if "chips" in link["href"]:
+                continue
+            match = re.search(r"/lots/(\d+)", link["href"])
+            if not match:
+                continue
+            if container.parent.find("a", {"class": "tc-item"}):
+                active.add(int(match.group(1)))
+        return active
 
     @staticmethod
     def _parse_categories(html: str) -> list:
@@ -220,6 +249,21 @@ class FunPayClient:
         raise RaiseError(message, wait_time=_parse_wait_time(message), raw=payload)
 
 
+def filter_by_active_lots(client: FunPayClient, categories: list) -> list:
+    active = client.fetch_active_lot_subcategories()
+    if active is None:
+        return categories
+
+    kept = []
+    for category in categories:
+        category.subcategories = [
+            s for s in category.subcategories if s.type != "lots" or s.id in active
+        ]
+        if category.common_subcategory_ids:
+            kept.append(category)
+    return kept
+
+
 class AutoRaiser:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -278,6 +322,13 @@ class AutoRaiser:
         if self.cfg.games:
             categories = [c for c in categories if c.id in self.cfg.games]
             logger.info("После фильтра по games осталось категорий: %d.", len(categories))
+
+        if self.cfg.only_with_lots:
+            try:
+                categories = filter_by_active_lots(self.client, categories)
+                logger.info("После фильтра по лотам осталось категорий: %d.", len(categories))
+            except FunPayError as exc:
+                logger.error("Не удалось получить список лотов, поднимаю все категории: %s", exc)
 
         success = 0
         skipped = 0
@@ -392,6 +443,14 @@ def manual_mode(cfg: Config) -> int:
     raiser = AutoRaiser(cfg)
     raiser.cfg.ignore_cooldown = False
 
+    def load():
+        username, categories = raiser.client.fetch_account()
+        if cfg.games:
+            categories = [c for c in categories if c.id in cfg.games]
+        if cfg.only_with_lots:
+            categories = filter_by_active_lots(raiser.client, categories)
+        return username, categories
+
     print("=" * 60)
     print("FunPayAutoUP - ручное поднятие лотов")
     print("=" * 60)
@@ -404,14 +463,10 @@ def manual_mode(cfg: Config) -> int:
     print()
 
     try:
-        username, categories = raiser.client.fetch_account()
+        username, categories = load()
     except FunPayError as exc:
         print(f"Ошибка подключения: {exc}")
         return 1
-
-    if cfg.games:
-        categories = [c for c in categories if c.id in cfg.games]
-        print(f"Применён фильтр games, категорий: {len(categories)}")
 
     while True:
         _print_categories(categories, username)
@@ -428,7 +483,7 @@ def manual_mode(cfg: Config) -> int:
             break
         if command in ("r", "refresh", "обновить"):
             try:
-                username, categories = raiser.client.fetch_account()
+                username, categories = load()
                 print(f"Список обновлён. Категорий: {len(categories)}")
             except FunPayError as exc:
                 print(f"Ошибка обновления: {exc}")
@@ -526,6 +581,7 @@ def load_config(path: str) -> Config:
         retry_delay=float(get("raise", "retry_delay", "30")),
         max_retries=int(get("raise", "max_retries", "0")),
         ignore_cooldown=_as_bool(get("raise", "ignore_cooldown"), False),
+        only_with_lots=_as_bool(get("raise", "only_with_lots"), True),
         games=games,
         log_level=get("logging", "level", "INFO"),
         log_file=get("logging", "file", "logs/funpay_autoup.log"),
